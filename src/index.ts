@@ -47,7 +47,7 @@ interface BuildInfo {
 }
 
 const TMP = tmpdir();
-const DEFAULT_DENO_VERSION = 'v1.2.0';
+const DEFAULT_DENO_VERSION = 'v1.5.4';
 
 // `chmod()` is required for usage with `vercel-dev-runtime` since
 // file mode is not preserved in Vercel deployments from the CLI.
@@ -126,6 +126,13 @@ export async function build({
 		configString(config, 'denoVersion', process.env, 'DENO_VERSION') ||
 		DEFAULT_DENO_VERSION;
 
+	const denoTsConfig = configString(
+		config,
+		'tsconfig',
+		process.env,
+		'DENO_TSCONFIG'
+	);
+
 	if (!denoVersion.startsWith('v')) {
 		denoVersion = `v${denoVersion}`;
 	}
@@ -143,6 +150,10 @@ export async function build({
 
 	if (unstable) {
 		env.DENO_UNSTABLE = '1';
+	}
+
+	if (denoTsConfig) {
+		env.DENO_TSCONFIG = denoTsConfig;
 	}
 
 	const builderPath = join(__dirname, 'build.sh');
@@ -168,7 +179,7 @@ export async function build({
 		const graph: Graph = JSON.parse(await readFile(file, 'utf8'));
 		for (let i = 0; i < graph.deps.length; i++) {
 			const dep = graph.deps[i];
-			if (dep.startsWith(workPathUri)) {
+			if (typeof dep === 'string' && dep.startsWith(workPathUri)) {
 				const relative = dep.substring(workPathUri.length + 1);
 				const updated = `file:///var/task/${relative}`;
 				graph.deps[i] = updated;
@@ -193,7 +204,7 @@ export async function build({
 		} = buildInfo.program;
 
 		for (const filename of Object.keys(fileInfos)) {
-			if (filename.startsWith(workPathUri)) {
+			if (typeof filename === 'string' && filename.startsWith(workPathUri)) {
 				const relative = filename.substring(workPathUri.length + 1);
 				const updated = `file:///var/task/${relative}`;
 				fileInfos[updated] = fileInfos[filename];
@@ -206,7 +217,7 @@ export async function build({
 		for (const [filename, refs] of Object.entries(referencedMap)) {
 			for (let i = 0; i < refs.length; i++) {
 				const ref = refs[i];
-				if (ref.startsWith(workPathUri)) {
+				if (typeof ref === 'string' && ref.startsWith(workPathUri)) {
 					const relative = ref.substring(workPathUri.length + 1);
 					const updated = `file:///var/task/${relative}`;
 					refs[i] = updated;
@@ -215,7 +226,7 @@ export async function build({
 				}
 			}
 
-			if (filename.startsWith(workPathUri)) {
+			if (typeof filename === 'string' && filename.startsWith(workPathUri)) {
 				const relative = filename.substring(workPathUri.length + 1);
 				const updated = `file:///var/task/${relative}`;
 				referencedMap[updated] = refs;
@@ -228,7 +239,7 @@ export async function build({
 		for (const [filename, refs] of Object.entries(exportedModulesMap)) {
 			for (let i = 0; i < refs.length; i++) {
 				const ref = refs[i];
-				if (ref.startsWith(workPathUri)) {
+				if (typeof ref === 'string' && ref.startsWith(workPathUri)) {
 					const relative = ref.substring(workPathUri.length + 1);
 					const updated = `file:///var/task/${relative}`;
 					refs[i] = updated;
@@ -237,7 +248,7 @@ export async function build({
 				}
 			}
 
-			if (filename.startsWith(workPathUri)) {
+			if (typeof filename === 'string' && filename.startsWith(workPathUri)) {
 				const relative = filename.substring(workPathUri.length + 1);
 				const updated = `file:///var/task/${relative}`;
 				exportedModulesMap[updated] = refs;
@@ -249,7 +260,7 @@ export async function build({
 
 		for (let i = 0; i < semanticDiagnosticsPerFile.length; i++) {
 			const ref = semanticDiagnosticsPerFile[i];
-			if (ref.startsWith(workPathUri)) {
+			if (typeof ref === 'string' && ref.startsWith(workPathUri)) {
 				const relative = ref.substring(workPathUri.length + 1);
 				const updated = `file:///var/task/${relative}`;
 				semanticDiagnosticsPerFile[i] = updated;
@@ -271,6 +282,10 @@ export async function build({
 		...(await glob('.deno/**/*', workPath)),
 	};
 
+	if (denoTsConfig) {
+		sourceFiles.add(denoTsConfig);
+	}
+
 	console.log('Detected source files:');
 	for (const filename of Array.from(sourceFiles).sort()) {
 		console.log(` - ${filename}`);
@@ -279,16 +294,38 @@ export async function build({
 		});
 	}
 
+	if (config.includeFiles) {
+		const includeFiles =
+			typeof config.includeFiles === 'string'
+				? [config.includeFiles]
+				: config.includeFiles;
+
+		console.log('Including additional files:');
+		for (const pattern of includeFiles) {
+			const matches = await glob(pattern, workPath);
+			for (const name of Object.keys(matches)) {
+				if (!outputFiles[name]) {
+					console.log(` - ${name}`);
+					outputFiles[name] = matches[name];
+				}
+			}
+		}
+	}
+
 	const lambdaEnv: { [name: string]: string } = {};
 
 	if (unstable) {
 		lambdaEnv.DENO_UNSTABLE = '1';
 	}
 
+	if (denoTsConfig) {
+		lambdaEnv.DENO_TSCONFIG = denoTsConfig;
+	}
+
 	const output = await createLambda({
 		files: outputFiles,
 		handler: entrypoint,
-		runtime: 'provided',
+		runtime: 'provided.al2',
 		environment: lambdaEnv,
 	});
 
@@ -339,6 +376,13 @@ export async function startDevServer({
 			'DENO_UNSTABLE'
 		) || false;
 
+	const denoTsconfig = configString(
+		config,
+		'tsconfig',
+		meta.buildEnv || {},
+		'DENO_TSCONFIG'
+	);
+
 	const portFile = join(
 		TMP,
 		`vercel-deno-port-${Math.random().toString(32).substring(2)}`
@@ -353,15 +397,16 @@ export async function startDevServer({
 
 	const args: string[] = ['run'];
 
+	if (denoTsconfig) {
+		args.push('--config', denoTsconfig);
+	}
+
 	if (unstable) {
 		args.push('--unstable');
 	}
 
 	args.push(
-		'--allow-env',
-		'--allow-net',
-		'--allow-read',
-		'--allow-write',
+		'--allow-all',
 		join(__dirname, 'dev-server.ts')
 	);
 
